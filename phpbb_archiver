@@ -1,0 +1,693 @@
+#! /usr/bin/perl -w
+use strict;
+use warnings;
+use utf8;
+use DateTime;
+use Getopt::Std;
+use DBI();
+use open ':std', ':encoding(UTF-8)';
+
+require LWP::UserAgent;
+require HTTP::Cookies;
+
+
+# Configuring the LWP object
+my $ua = LWP::UserAgent->new;
+$ua->timeout(10); 
+$ua->env_proxy;
+$ua->agent('Mozilla/5.0');
+$ua->cookie_jar( {} );
+
+
+#######################################################################
+# Main Functionality                                                  #
+#######################################################################
+
+# Print information about the script if no arguments are provided
+my %opt;
+getopts( "u:p:dic", \%opt ) or usage();
+
+# Handling the dry-run switch
+my $dry_run = 0; # False
+if ($opt{d}){
+	$dry_run = 1;
+}
+
+# Don't want to fetch users and posts at the same time.
+if ($opt{u} && $opt{p}){
+	usage();
+}
+
+# Load configuration values from .phpbbarchiverconfig
+my $phpbb_username = "";
+my $phpbb_password = "";
+my $mysql_host = "";
+my $mysql_user = "";
+my $mysql_password = "";
+my $mysql_database = "";
+&read_config_file;
+my $database_object;
+
+# V. IMPORTANT!
+# TODO: Move this into the configuration file
+my $phpbb_website_url = "";
+
+# Retrieve a user upon being passed a user ID
+if ($opt{u}){
+	if ($opt{u} !~ /^\d+$/){
+		die "Error: User ID must be numeric\n";
+	}
+
+	&database_connect;
+	&authenticate;
+	&fetch_user($opt{u});
+	&database_disconnect;
+}
+
+# Retrieve a post upon being passed a post ID
+if ($opt{p}){
+	if ($opt{p} !~ /^\d+$/){
+		die "Error: Post ID must be numeric\n";
+	}
+	&database_connect;
+	&authenticate;
+	&fetch_post($opt{p});
+	&database_disconnect;
+}
+
+# Run the post/user archiver in a pseudo-daemon mode
+if ($opt{c}){
+	&database_connect;
+	&authenticate;
+
+	# First retrieve the latest post and user IDs stored in the database
+	my $latest_post_db = &get_latest_post_db;
+	my $latest_user_db = &get_latest_user_db;
+	my $latest_post_phpbb = 0;
+	my $latest_user_phpbb = 0;
+	my $posts_to_fetch = 0;
+	my $users_to_fetch = 0;
+	print "Latest post in DB: " . $latest_post_db;
+	print "  --  Latest user in DB: " . $latest_user_db . "\n";
+
+	while (){
+
+		# Fetch latest member and post IDs from the phpBB homepage
+		my @latest_ids_phpbb = get_newest_ids_from_phpbb();
+		$latest_post_phpbb = $latest_ids_phpbb[1];
+		$latest_user_phpbb = $latest_ids_phpbb[0];
+		print "\nLatest post on phpBB: " . $latest_post_phpbb;
+		print "  --  Latest user on phpBB: " . $latest_user_phpbb . "\n";
+		print "Latest post in DB: " . $latest_post_db;
+		print "  --  Latest user in DB: " . $latest_user_db . "\n";
+
+		# Handles adding new posts
+		if($latest_post_phpbb > $latest_post_db){
+			my $posts_to_fetch = $latest_post_phpbb - $latest_post_db;
+			print "  Need to fetch " . $posts_to_fetch . " posts.\n";
+
+			my $i;
+			for ($i = 1; $i <= $posts_to_fetch; $i++){
+				my $current_post_to_fetch = $latest_post_db + $i;
+				print "  Now fetching post " . $current_post_to_fetch . "\n";
+				&fetch_post($current_post_to_fetch);
+				sleep 1;
+			}
+
+			# Update latest post ID in DB
+			$latest_post_db = $latest_post_phpbb;
+		} 
+
+
+		# Handles adding new users
+		if($latest_user_phpbb > $latest_user_db){
+			my $users_to_fetch = $latest_user_phpbb - $latest_user_db;
+			print "  Need to fetch " . $users_to_fetch . " users.\n";
+
+			my $i;
+			for ($i = 1; $i <= $users_to_fetch; $i++){
+				my $current_user_to_fetch = $latest_user_db + $i;
+				print "  Now fetching user " . $current_user_to_fetch . "\n";
+				&fetch_user($current_user_to_fetch);
+				sleep 1;
+			}
+
+			# Update latest user ID in DB
+			$latest_user_db = $latest_user_phpbb;
+		}
+
+		sleep 5;
+	}
+
+
+	&database_disconnect;
+}
+
+if ($opt{i}){
+	print "\nStarting an initial import of data.\n";
+	&authenticate;
+	&database_connect;
+
+	# Find latest member ID and then import all members
+	my $newest_member_id = &get_newest_member_id;
+	my $member_counter;
+	for ($member_counter = 1; $member_counter <= $newest_member_id; $member_counter++){
+		print "Retrieving user with ID " . $member_counter . "\n";
+		if (!$dry_run){
+			#fetch_user($member_counter);
+			#sleep(2);
+		}
+	}
+
+	# Find latest post ID and then import all members
+	my $newest_post_id = &get_newest_post_id;
+	my $post_counter;
+	for ($post_counter = 1; $post_counter <= $newest_post_id; $post_counter++){
+		print "Retrieving post with ID " . $post_counter . "\n";
+		if (!$dry_run){
+			fetch_post($post_counter);
+			sleep(1);
+		}
+	}
+
+	&database_disconnect;
+}
+
+
+
+
+#######################################################################
+# SUBROUTINES                                                         #
+#######################################################################
+sub fetch_post {
+	my $post_content = "";
+	my $post_poster = "";
+	my $post_subject = "";
+	my $post_topic = "";
+	my $post_date = "";
+	my $post_poster_id = "";
+	my $post_edited = 0; # 1 if edited
+	my $post_page_content = "";
+	my $post_forum = "";
+
+	my ($post_id) = @_;
+	print "    Now fetching post with the ID " . $post_id . "\n";
+
+	# Fetch post page content
+	my $post_url = $phpbb_website_url . "/post" . $post_id . ".html#p" . $post_id;
+	my $post_page_request = $ua->get($post_url);
+
+	if ($post_page_request->is_success) { 
+		$post_page_content = $post_page_request->decoded_content; 
+	} else {
+		print "Post page request failed. Function exiting.\n";
+		return;
+	}
+
+	if ($post_page_content =~ m|<a name="p$post_id"></a>\s*<div class="postauthor" style="color: #\w*">(.*?)</div>.*?\.com/topic(.*?)\.html#p$post_id">(.*?)</a></div>\s*<div class="postbody">(.*?)<br clear="all" /><br />\s*</td>\s*</tr>\s*<tr class="row\d+">\s*<td class="postbottom" align="center">(.*?)</td>\s*<td class="postbottom postbuttons" valign="middle">.*?<a href="$phpbb_website_url/member(.*?)\.html|s) {
+
+		$post_content = $4;
+		$post_poster = $1;
+		$post_subject = $3;
+		$post_topic = $2;
+		$post_date = $5;
+		$post_poster_id = $6;
+		$post_poster_id =~ s/^\s+|\s+$//g; # Thanks to http://perlmaven.com/trim
+		$post_content =~ s|</div>\s+$||g;
+	} else {
+		print "Failed to retrieve any post content!\n";
+		return;
+	}
+
+	# Converting the topic to the correct format
+	if ($post_topic =~ m|(\d+)-(\d+)|){
+		$post_topic = $1;
+	}
+
+	# Has post been edited?
+	if ($post_content =~ m|<div class="edited">|){
+		$post_edited = 1;
+	}
+
+	# Convert the date to ISO-8601, UTC
+	$post_date = &convert_time_to_utc_datetime($post_date);
+
+	# Now printing out what we found out about the post for debugging purposes
+	if ($dry_run){
+		print "Poster:\t\t " . $post_poster . "\n";
+		print "Poster ID:\t " . $post_poster_id . "\n";
+		print "Subject:\t " . $post_subject . "\n";
+		print "Topic ID:\t " . $post_topic . "\n";
+		print "Date:\t\t " . $post_date . "\n";
+		print "Content:\t " . $post_content . "\n";
+		print "Edited?\t" . $post_edited . "\n;";
+	}
+
+
+	# Insert into database
+	if (!$dry_run){
+		$database_object->do(qq{SET NAMES 'utf8';});
+		$database_object->do('INSERT INTO posts VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE id=id', undef, $post_id, $post_poster_id, $post_content, $post_date, $post_edited, $post_topic, $post_subject, $post_forum);
+	}
+}
+
+
+
+sub fetch_user {
+	my $profile_page_content = "";
+	my $member_name = "";
+	my $member_gender = 0; # 0-Undeclared, 1-Male, 2-Female
+	my $member_location = "";
+	my $member_country = "";
+	my $member_avatar = "";
+	my $member_age = "";
+	my $member_joindate_datetime = "";
+	my $member_im_email = "";
+	my $member_im_msn = "";
+	my $member_im_aim = "";
+	my $member_im_skype = "";
+	my $member_im_yahoo = "";
+	my $member_im_icq = "";
+	my $member_im_jabber = "";
+	my $member_website = "";
+	my $member_occupation = "";
+	my $member_interests = "";
+	my $member_mood = "";
+	my $member_away = ""; # 1-Away, 0-Not away
+
+	my ($user_id) = @_;
+	print "\n    Now retrieving user " . $user_id . "\n";
+
+	# Fetch user page content
+	my $profile_url = $phpbb_website_url . "/member" . $user_id . ".html";
+	my $profile_page_request = $ua->get($profile_url);
+
+
+	if ($profile_page_request->is_success) { 
+		$profile_page_content = $profile_page_request->decoded_content; 
+		} else {
+			print "Profile page request failed. Function exiting.\n";
+			return;
+		}
+
+
+	# Retrieving member name
+	if ($profile_page_content =~ m|<title>Viewing profile - (.*?)</title>|) {
+		$member_name = $1;
+	}
+
+	# Retrieving member gender
+	if ($profile_page_content =~ m|Sex: </td>\s*<td><b class="genmed">(.*?)</b>|) {
+		my $member_gender_text = $1;
+
+		if ($member_gender_text =~ m|Male|){
+			$member_gender = 1;
+		}
+
+		if ($member_gender_text =~ m|Female|){
+			$member_gender = 2;
+		}
+
+	}
+
+	# Retrieving member location
+	if ($profile_page_content =~ m|Location: </td>\s*<td><b class="genmed">(.*?)</b>|) {
+		$member_location = $1;
+	}
+
+	# Retrieving member country
+	if ($profile_page_content =~ m|Country: </td>\s*<td><b class="genmed">(.*?)</b>|) {
+		$member_country = $1;
+	}
+
+	# Retrieving member avatar
+	if ($profile_page_content =~ m|<img src="(.*?)" width="\d+" height="\d+" alt="User avatar" />|) {
+		$member_avatar = $1;
+	}
+
+	# Retrieving member age
+	if ($profile_page_content =~ m|Age: </td>\s*<td><b class="genmed">(.*?)</b>|) {
+		$member_age = $1;
+	}
+
+	# Retrieving member join date
+	# Format: Sun Nov 10, 2013 4:50 pm
+	if ($profile_page_content =~ m|Joined: </td>\s*<td width="100%"><b class="gen">(.*?)</b>|) {
+			my $member_joindate_original = $1;
+			$member_joindate_datetime = &convert_time_to_utc_datetime($member_joindate_original);
+		
+	}
+
+	# Retrieving member email
+	if ($profile_page_content =~ m|E-mail address: </td>\s*<td width="100%">(.*?)</td>|) {
+		$member_im_email = $1;
+	}
+
+		# Retrieving member IM MSN
+		if ($profile_page_content =~ m|MSNM/WLM: </td>\s*<td>(.*?)</td>|) {
+			$member_im_msn = $1;
+		}
+
+		# Retrieving member IM AIM
+		if ($profile_page_content =~ m|AIM: </td>\s*<td>(.*?)</td>|) {
+			$member_im_aim = $1;
+		}
+
+		# Retrieving member IM Yahoo
+		if ($profile_page_content =~ m|YIM: </td>\s*<td><a href="http://edit.yahoo.com/config/send_webmesg\?.target=(.*?)&amp;.src=pg"|g) {
+			$member_im_yahoo = $1;
+		}
+
+		# Retrieving member IM Skype
+		if ($profile_page_content =~ m|Skype: </td>\s*<td><b class="genmed">(.*?)</b>|) {
+			$member_im_skype = $1;
+		}
+
+		# Retrieving member IM Jabber
+		if ($profile_page_content =~ m|Jabber: </td>\s*<td><img src="./styles/hestia/imageset/icon_contact_jabber.gif" width="38" height="13" alt="(.*?)"|) {
+			$member_im_jabber = $1;
+		}
+
+		# Retrieving member IM ICQ
+		if ($profile_page_content =~ m|ICQ: </td>\s*<td><a href="http://www.icq.com/people/(.*?)/"|) {
+			$member_im_icq = $1;
+		}
+
+		# Retrieving member website
+		if ($profile_page_content =~ m|Website: </td>\s*<td><b><a class="genmed" href="(.*?)"|) {
+			$member_website = $1;
+		}
+
+		# Retrieving member occupation
+		if ($profile_page_content =~ m|Occupation: </td>\s*<td><b class="genmed">(.*?)</b></td>|) {
+			$member_occupation = $1;
+		}
+
+		# Retrieving member interests
+		if ($profile_page_content =~ m|Interests: </td>\s*<td><b class="genmed">(.*?)</b></td>|) {
+			$member_interests = $1;
+		}
+
+		# Retrieving member mood
+		if ($profile_page_content =~ m|Mood: </td>\s*<td><b class="genmed">(.*?)</b></td>|) {
+			$member_mood = $1;
+		}
+
+		# Retrieving member status (e.g. away)
+		if ($profile_page_content =~ m|Status: </td>\s*<td><b class="genmed">(.*?)</b></td>|) {
+			$member_away = $1;
+		}
+
+
+	# Now print out everything we learned about the user
+	if ($dry_run){
+		print "User ID:\t" . $user_id . "\n";
+		print "Name:\t\t" . $member_name . "\n";
+		print "Gender:\t\t" . $member_gender . "\n";
+		print "Location:\t" . $member_location . "\n";
+		print "Country:\t" . $member_country . "\n";
+		print "Avatar:\t\t" . $member_avatar . "\n";
+		print "Age:\t\t" . $member_age . "\n";
+		print "Joindate (UTC):\t" . $member_joindate_datetime . "\n";
+		print "IM Email:\t\t" . $member_im_email . "\n";
+		print "IM MSN:\t\t" . $member_im_msn . "\n";
+		print "IM AIM:\t\t" . $member_im_aim . "\n";
+		print "IM Skype:\t" . $member_im_skype . "\n";
+		print "IM Yahoo:\t" . $member_im_yahoo . "\n";
+		print "IM ICQ:\t\t" . $member_im_icq . "\n";
+		print "IM Jabber:\t" . $member_im_jabber . "\n";
+		print "Website:\t" . $member_website . "\n";
+		print "Occupation:\t" . $member_occupation . "\n";
+		print "Interests:\t" . $member_interests . "\n";
+		print "Mood:\t\t" . $member_mood . "\n";
+		print "Away:\t\t" . $member_away . "\n";
+	}
+
+	if (!$dry_run){
+		$database_object->do(qq{SET NAMES 'utf8';});
+		$database_object->do('INSERT INTO members VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE id=id', undef, $user_id, $member_name, $member_location, $member_gender, $member_country, $member_avatar, $member_age, $member_joindate_datetime, $member_im_msn, $member_im_aim, $member_im_skype, $member_im_yahoo, $member_im_icq, $member_im_jabber, $member_website, $member_occupation, $member_interests, $member_mood, $member_away);
+	}
+
+
+	return 0;
+}
+
+# Authentication subroutine. Call first before trying to retrieve other pages.
+sub authenticate
+{
+	print "Now trying to login to phpBB using the account '".$phpbb_username."'\n";
+
+	my $login_test = $ua->post( $phpbb_website_url . "/ucp.php?mode=login" , { 'username' => $phpbb_username, 
+		'password' => $phpbb_password,
+		'autologin' => "on",
+		'viewonline' => "on",
+		'sid' => "cc11d8c0310e152a9b032a3d8523c500",
+		'redirect' => "./index2.php",
+		'login' => "Login" } );
+
+	if ($login_test->is_success) {
+
+	    # Perform a regex search on the resulting page.
+	    if ($login_test->decoded_content =~ m/successfully/g) {
+	    	print "Authentication was successful.\n";
+	    	} else {
+	    		print "Authentication failed. Invalid user account details.\n";
+	    	}
+
+	    	} else {
+
+	    		print "Authentication failed. Script exiting.\n";
+	    		die $login_test->status_line;
+
+	    	}
+	    }
+
+
+	    sub usage {
+	    	print "phpBB Archival Tool by rgamec\n\n";
+	    	print "Basic Startup Options:\n";
+	    	print " -u userid\n";
+	    	print "    Retrieve user with specified ID.\n\n";
+	    	print " -p postid\n";
+	    	print "   Retrieve post with specified ID.\n\n";
+	    	print " -d\n";
+	    	print "   Dry run; don't write to MySQL DB.\n\n";
+	    	exit 1;
+	    }
+
+sub read_config_file {
+	unless (-e ".phpbbarchiverconfig"){
+		print "Error: No .phpbbarchiverconfig file found. Please create one.\n";
+		exit 1;
+	}
+
+	open(CONFIG, '.phpbbarchiverconfig') or die "Error: Can't open configration file!\n";  
+	local $/; # http://perldoc.perl.org/perlvar.html#Variables-related-to-filehandles
+	my $phpbb_configuration = <CONFIG>; 
+	close (CONFIG);  
+
+	if ($phpbb_configuration =~ m|phpbb_username = "(.*?)"|){
+		$phpbb_username = $1;
+	} else {
+		die "Error: No phpbb_username value found in .phpbbarchiverconfig.\n";
+	}
+
+	if ($phpbb_configuration =~ m|phpbb_password = "(.*?)"|){
+		$phpbb_password = $1;
+	} else {
+		die "Error: No phpbb_password value found in .phpbbarchiverconfig.\n";
+	}
+
+	# LOAD MYSQL CONFIG
+	if ($phpbb_configuration =~ m|mysql_host = "(.*?)"|){
+		$mysql_host = $1;
+	} else {
+		die "Error: No mysql_host value found in .phpbbarchiverconfig.\n";
+	}
+
+	if ($phpbb_configuration =~ m|mysql_user = "(.*?)"|){
+		$mysql_user = $1;
+	} else {
+		die "Error: No mysql_user value found in .phpbbarchiverconfig.\n";
+	}
+
+	if ($phpbb_configuration =~ m|mysql_password = "(.*?)"|){
+		$mysql_password = $1;
+	} else {
+		die "Error: No mysql_password value found in .phpbbarchiverconfig.\n";
+	}
+
+	if ($phpbb_configuration =~ m|mysql_database = "(.*?)"|){
+		$mysql_database = $1;
+	} else {
+		die "Error: No mysql_database value found in .phpbbarchiverconfig.\n";
+	}
+
+	print "Reading config file . . .\n";
+}
+
+sub convert_time_to_utc_datetime {
+	my ($original_time) = @_;
+	my $utc_datetime = "";
+
+	if ($original_time =~ m|(\w+) (\w+) (\d+), (\d+) (\d+?):(\d+?) (\w+)|){
+			# print "\tText: " . $member_joindate_original . "\n";
+			# print "\t\$1 = " . $1 . "\n"; 
+			# print "\t\$2 = " . $2 . "\n";
+			# print "\t\$3 = " . $3 . "\n";
+			# print "\t\$4 = " . $4 . "\n";
+			# print "\t\$5 = " . $5 . "\n";
+			# print "\t\$6 = " . $6 . "\n";
+			# print "\t\$7 = " . $7 . "\n";
+
+			# Convert the abbreviated month name to a number
+			# Thanks to http://www.perlmonks.org/?node_id=95456
+			my %mon2num = qw(
+				jan 1  feb 2  mar 3  apr 4  may 5  jun 6
+				jul 7  aug 8  sep 9  oct 10 nov 11 dec 12
+				);
+
+			# Handle am/pm
+			my $date_hour = $5;
+			if ($7 eq "pm") {
+				if ($5 < 12){
+					$date_hour += 12;
+				}
+			}
+			
+			# Generate a UNIX timestamp from the date components
+			my $dt = DateTime->new(
+				year       => $4,
+				month      => $mon2num{lc substr($2, 0, 3)},
+				day        => $3,
+				hour       => $date_hour,
+				minute     => $6,
+				second     => 0,
+				nanosecond => 0,
+				time_zone  => 'Europe/Zurich',
+				);
+
+			$dt->set_time_zone('UTC');
+			$utc_datetime = $dt->iso8601();
+		}
+
+		return $utc_datetime;
+	}
+
+
+sub database_connect {
+	if (!$dry_run){
+		print "Attempting to connect to MySQL server . . .\n";
+		$database_object = DBI->connect("DBI:mysql:database=$mysql_database;host=$mysql_host;port=",
+			"$mysql_user", "$mysql_password",
+			{'RaiseError' => 1});
+	}
+}
+
+sub database_disconnect {
+	if (!$dry_run){
+		print "Attempting to disconnect from the MySQL server . . .\n";
+		$database_object->disconnect();
+	}
+}
+
+# Return the ID of the most recently registered member
+sub get_newest_member_id {
+	my $main_page_content = "";
+	my $newest_member_id = "";
+
+	my $main_url = $phpbb_website_url;
+	my $main_page_request = $ua->get($main_url);
+
+	if ($main_page_request->is_success) { 
+		$main_page_content = $main_page_request->decoded_content; 
+
+		if ($main_page_content =~ m|Our newest member <strong><a rel="nofollow" href="$phpbb_website_url/member(.*?).html"|){
+			$newest_member_id = $1;
+			print "Newest member ID: " . $newest_member_id . "\n";
+		} else {
+			print "Unable to find ID of newest member!\n";
+		}
+
+	} else {
+		print "Error: Unable to load phpBB main page.\n";
+		die $main_page_request->status_line;
+	}
+	return $newest_member_id;
+}
+
+# Return the ID of the most recent post
+sub get_newest_post_id{
+	my $main_page_content = "";
+	my $newest_post_id = 0;
+
+	my $main_url = $phpbb_website_url;
+	my $main_page_request = $ua->get($main_url);
+
+	if ($main_page_request->is_success) { 
+		$main_page_content = $main_page_request->decoded_content; 
+
+		while ($main_page_content =~ m|<p class="topicdetails"><a href="$phpbb_website_url/post(.*?).html#p(.*?)"|g){
+			if ($1 > $newest_post_id){
+				$newest_post_id = $1;
+			}
+		}
+
+	} else {
+		print "Error: Unable to load phpBB main page.\n";
+		die $main_page_request->status_line;
+	}
+	return $newest_post_id;
+}
+
+
+sub get_newest_ids_from_phpbb {
+	my $main_page_content = "";
+	my $newest_member_id = "";
+	my $newest_post_id = 0;
+	my @newest_ids = (0,0);
+
+	my $main_url = $phpbb_website_url;
+	my $main_page_request = $ua->get($main_url);
+
+	if ($main_page_request->is_success) { 
+		$main_page_content = $main_page_request->decoded_content; 
+
+		if ($main_page_content =~ m|Our newest member <strong><a rel="nofollow" href="$phpbb_website_url/member(.*?).html"|){
+			$newest_member_id = $1;
+			#print "Newest member ID: " . $newest_member_id . "\n";
+		} else {
+			print "Unable to find ID of newest member!\n";
+		}
+
+		while ($main_page_content =~ m|<p class="topicdetails"><a href="http://$phpbb_website_url/post(.*?).html#p(.*?)"|g){
+			if ($1 > $newest_post_id){
+				$newest_post_id = $1;
+			}
+		}
+
+		} else {
+		print "Error: Unable to load phpBB main page.\n";
+		die $main_page_request->status_line;
+	}
+
+	# Return an array holding the two values
+	$newest_ids[0] = $newest_member_id;
+	$newest_ids[1] = $newest_post_id;
+	return @newest_ids;
+}
+
+
+sub get_latest_post_db {
+	my $latest_post_db = 0;
+	$database_object->do(qq{SET NAMES 'utf8';});
+	my @select_result = $database_object->selectrow_array("select id from posts order by id desc limit 1;");
+	return $select_result[0];
+}
+
+sub get_latest_user_db {
+	my $latest_user_db = 0;
+	$database_object->do(qq{SET NAMES 'utf8';});
+	my @select_result = $database_object->selectrow_array("select id from members order by id desc limit 1;");
+	return $select_result[0];
+}
